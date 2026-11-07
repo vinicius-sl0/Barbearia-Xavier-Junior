@@ -9,6 +9,11 @@
   const MAPS =
     "https://www.google.com/maps?q=R.+Sete+de+Setembro,+448+-+Capuan,+Caucaia+-+CE";
 
+  // Link do Google Apps Script que marca o horário na Google Agenda
+  // (código em apps-script/agenda.gs). Vazio = só confirma pelo WhatsApp.
+  const AGENDA_URL =
+    "https://script.google.com/macros/s/AKfycbwAAnCm7wfllwY1fNie-VPtgOehW9m1FaAMiVqtt_C75DY8qR9opb4vrsN0cCXAWkd0/exec";
+
   const SERVICOS = [
     { nome: "Corte Social", preco: 30 },
     { nome: "Barba", preco: 20 },
@@ -54,6 +59,7 @@
   // Estado do agendamento em andamento (null = conversa livre)
   let booking = null;
   let started = false;
+  let busy = false; // true enquanto espera a resposta da agenda
 
   function open() {
     win.hidden = false;
@@ -110,6 +116,7 @@
   });
 
   function handle(text) {
+    if (busy) return;
     addMsg(escapeHtml(text), "user");
     options.innerHTML = "";
     // Pequeno atraso para parecer uma conversa
@@ -248,7 +255,55 @@
     }
   }
 
-  function finishBooking() {
+  // Envia o agendamento para a Google Agenda. Retorna a resposta ou null se falhar.
+  async function salvarNaAgenda() {
+    const d = booking.data;
+    const pad = (n) => String(n).padStart(2, "0");
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      // Sem Content-Type JSON de propósito: o Apps Script não aceita a checagem extra (CORS)
+      const res = await fetch(AGENDA_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          nome: booking.nome,
+          servico: booking.servico,
+          data: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+          hora: booking.horario,
+        }),
+        signal: ctrl.signal,
+      });
+      return await res.json();
+    } catch (e) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function finishBooking() {
+    let marcado = false;
+    if (AGENDA_URL) {
+      bot("Verificando o horário na agenda... ⏳");
+      busy = true;
+      const r = await salvarNaAgenda();
+      busy = false;
+      if (r && r.ocupado) {
+        if (r.livres && r.livres.length) {
+          bot("Esse horário já está ocupado. 😕 Escolha um dos horários livres:");
+          return showOptions([...r.livres, "❌ Cancelar"]);
+        }
+        bot("Não há mais horários livres nesse dia. 😕 Vamos escolher outro dia:");
+        booking.step = "data";
+        return showOptions([...nextDays(), "❌ Cancelar"]);
+      }
+      if (r && r.invalido) {
+        bot(`${escapeHtml(r.erro)} Escolha outro horário:`);
+        return showOptions([...slotsFor(booking.data), "❌ Cancelar"]);
+      }
+      marcado = !!(r && r.ok);
+    }
+
     const dataFmt = booking.data.toLocaleDateString("pt-BR");
     const msg = `Olá, sou ${booking.nome}, gostaria de marcar: ${booking.servico}, em ${dataFmt} às ${booking.horario}h.`;
     const url = `https://wa.me/${WHATSAPP}?text=${encodeURIComponent(msg)}`;
@@ -259,6 +314,11 @@
         `• <b>Data:</b> ${dataFmt}<br>` +
         `• <b>Horário:</b> ${booking.horario}`
     );
+    if (marcado) {
+      bot("✅ Horário reservado na nossa agenda! Agora é só confirmar pelo WhatsApp:");
+    } else if (AGENDA_URL) {
+      bot("Não consegui registrar na agenda agora, mas você pode confirmar direto pelo WhatsApp:");
+    }
     bot(`<a class="bxj-wa-btn" href="${url}" target="_blank" rel="noopener">Confirmar no WhatsApp</a>`);
     booking = null;
     showOptions(["⬅️ Menu"]);
